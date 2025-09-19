@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "functions": {
+    "api/**/*.{js,ts}": {
+      "memory": 768,
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    { "src": "/api/cron-scrape", "dest": "/api/cron-scrape.js?cron=1" },
+    { "src": "/api/(.*)", "dest": "/api/index.js" }
+  ],
+  "crons": [
+    { "path": "/api/cron-scrape", "schedule": "0 1 * * *" }
+  ]
+}

@@ -1,0 +1,49 @@
+// Scheduled cron endpoint for Vercel; offloads heavy work to Supabase Edge Function
+const { triggerEdgeNewsScrape } = require('../services/edgeOffloader');
+
+// Helper to compute default date range (yesterday -> today) in YYYY-MM-DD
+function defaultRange() {
+  const now = new Date();
+  const today = now.toISOString().slice(0,10);
+  const yest = new Date(now.getTime() - 24*60*60*1000).toISOString().slice(0,10);
+  return { from: yest, to: today };
+}
+
+// Vercel Cron cannot set custom headers; allow bypass when ?cron=1 is present via route rewrite.
+module.exports = async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    res.setHeader('Allow', 'GET, POST');
+    return res.status(405).json({ error: 'method_not_allowed' });
+  }
+
+  const isCronRewrite = req.query?.cron === '1' || req.query?.cron === 'true';
+  const secret = process.env.CRON_SECRET;
+  if (!isCronRewrite && secret && req.headers['x-cron-secret'] !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  // Accept optional overrides via query (?from=YYYY-MM-DD&to=YYYY-MM-DD&limit=75&candidateLimit=800)
+  const { from: qFrom, to: qTo, limit: qLimit, candidateLimit: qCand } = req.query || {};
+  const body = req.body || {};
+  const from = (body.from || qFrom) || defaultRange().from;
+  const to = (body.to || qTo) || defaultRange().to;
+  const limitNum = body.limit || qLimit;
+  const candNum = body.candidateLimit || qCand;
+  const limit = limitNum ? parseInt(limitNum, 10) : undefined;
+  const candidateLimit = candNum ? parseInt(candNum, 10) : undefined;
+  const started = Date.now();
+  console.log(`[cron-scrape] START from=${from} to=${to} limit=${limit||'default'} candidateLimit=${candidateLimit||'default'} isCron=${isCronRewrite}`);
+
+  try {
+    const result = await triggerEdgeNewsScrape({ from, to, limit, candidateLimit });
+    const dur = Date.now() - started;
+    console.log(`[cron-scrape] COMPLETE status=${result.ok?'ok':'fail'} duration_ms=${dur}`);
+    return res.status(result.ok ? 200 : (result.status || 500)).json({ ...result, from, to, limit: limit||null, candidateLimit: candidateLimit||null, duration_ms: dur });
+  } catch (e) {
+    const dur = Date.now() - started;
+    console.error('[cron-scrape] ERROR', e?.message || e);
+    return res.status(500).json({ error: e.message || 'cron_error', from, to, duration_ms: dur });
+  }
+};
