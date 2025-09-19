@@ -13,12 +13,14 @@ const express = require("express");
 const app = express();
 const articleRoutes = require("./routes/articles");
 const offloadRoutes = require("./routes/offload");
+const healthRoutes = require("./routes/health");
 require("dotenv").config();
 const PORT = process.env.PORT || 4000;
 
 app.use(express.json());
 app.use("/api/articles", articleRoutes);
 app.use('/api/offload', offloadRoutes); // proxy that hides Supabase project ref
+app.use('/api', healthRoutes); // /api/offload/health presence check
 
 // Only start listening when executed directly (local dev).
 if (require.main === module) {

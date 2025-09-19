@@ -232,9 +232,10 @@ const manualScrape = async (req, res) => {
     try {
         const stats = await fetchAndStoreNews(from, to, { mode: 'manual', manualLimit: validLimit, candidateLimit: validCandidateLimit });
         const dur = Date.now() - start;
-        console.log(`[manualScrape] COMPLETE sync range=${from}->${to} limit=${validLimit || 'default'} candidateLimit=${validCandidateLimit || 'default'} duration_ms=${dur}`);
-        return res.status(200).json({
-            message: 'Scrape completed',
+        console.log(`[manualScrape] COMPLETE sync range=${from}->${to} limit=${validLimit || 'default'} candidateLimit=${validCandidateLimit || 'default'} duration_ms=${dur} inserted=${stats?.inserted} zero_reason=${stats?.zero_reason || 'none'}`);
+        const statusCode = stats && stats.inserted > 0 ? 200 : 200; // still 200 but client can inspect zero_reason
+        return res.status(statusCode).json({
+            message: stats.inserted ? 'Scrape completed' : 'Scrape completed with zero inserts',
             from,
             to,
             limit: validLimit || null,
@@ -245,7 +246,7 @@ const manualScrape = async (req, res) => {
     } catch (err) {
         const dur = Date.now() - start;
         console.error(`[manualScrape] ERROR sync range=${from}->${to} limit=${validLimit || 'default'} candidateLimit=${validCandidateLimit || 'default'} duration_ms=${dur} msg=${err?.message || err}`);
-        return res.status(500).json({ error: err?.message || 'scrape_failed' });
+        return res.status(500).json({ error: err?.message || 'scrape_failed', duration_ms: dur });
     }
 };
 

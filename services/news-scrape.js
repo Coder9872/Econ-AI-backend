@@ -16,7 +16,7 @@ const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const GEMINI_TITLE_MODEL = 'gemini-2.5-flash'
 // Title ranking batch size and keep ratio (fraction of each batch to keep)
 const TITLE_RANK_BATCH_SIZE = 100; //change to 100
-const TITLE_RANK_KEEP_RATIO = 0.25; // keep top 25% of each batch (adapts to smaller batches)
+const TITLE_RANK_KEEP_RATIO = 0.10; // keep top 10% of each batch (adapts to smaller batches)
 
 // ---------------- Gemini API Rate Limiting & Retry Helpers ----------------
 // Separate token buckets per model (title=2.5-pro, summary=2.5-flash-lite)
@@ -392,7 +392,14 @@ async function fetchAndStoreNews(from, to, opts = {}) {
   phase(`INIT mode=${mode} range=${from}->${to} limits(manual=${manualLimit},cron=${cronLimit}) candidateLimit=${candidateLimit} concurrency=${concurrency} models(summary=${GEMINI_MODEL}, title=${GEMINI_TITLE_MODEL}) rpms(summary=${limiterSummary.getBase()}, title=${limiterTitle.getBase()})`);
   const url = `${NEWS_API_URL}?api_token=${NEWS_API_KEY}&from=${from}&to=${to}&limit=${candidateLimit}`;
   phase('FETCH start');
-  const stats = { mode, from, to, candidateLimit, manualLimit, cronLimit, started_at: new Date().toISOString(), fetched_total: 0, analyzed: 0, kept_ranked: 0, final_after_dedupe: 0, inserted: 0, conflicts: 0, duration_ms: 0 };
+  const stats = { mode, from, to, candidateLimit, manualLimit, cronLimit, started_at: new Date().toISOString(), fetched_total: 0, analyzed: 0, kept_ranked: 0, final_after_dedupe: 0, inserted: 0, conflicts: 0, insert_errors: 0, errors: [], zero_reason: null, duration_ms: 0 };
+  if (!NEWS_API_URL || !NEWS_API_KEY) {
+    stats.zero_reason = 'missing_env';
+    stats.errors.push({ type: 'config', message: 'Missing NEWS_API_URL or NEWS_API_KEY env var' });
+    phase('CONFIG missing required env vars');
+    stats.duration_ms = Math.round(performance.now() - t0);
+    return stats;
+  }
   try {
     const response = await axios.get(url, { timeout: 30000 });
     phase('FETCH done');
@@ -400,6 +407,7 @@ async function fetchAndStoreNews(from, to, opts = {}) {
     let articles = Array.isArray(raw) ? raw : raw.data ? raw.data : [];
     if (!articles.length) {
       phase("NO ARTICLES - EXIT");
+      stats.zero_reason = 'no_articles_returned';
       stats.duration_ms = Math.round(performance.now() - t0);
       return stats;
     }
@@ -476,6 +484,7 @@ async function fetchAndStoreNews(from, to, opts = {}) {
     const analyzed = enriched.filter(a => a._analysis && typeof a._analysis.relevance_score === 'number');
     if (!analyzed.length) {
       console.warn('No successfully analyzed articles. Aborting.');
+      stats.zero_reason = 'analysis_failed_all';
       stats.duration_ms = Math.round(performance.now() - t0);
       return stats;
     }
@@ -514,7 +523,7 @@ async function fetchAndStoreNews(from, to, opts = {}) {
   let inserted = 0;
   let conflicts = 0;
     phase('UPSERT start');
-    for (const art of finalList) {
+  for (const art of finalList) {
       const title = art.title ?? art.headline ?? null;
       if (!title) continue; // safety
       const link = art.link ?? art.url ?? null;
@@ -595,12 +604,17 @@ async function fetchAndStoreNews(from, to, opts = {}) {
     }
       if (error) {
         console.error('Insert error:', error);
+        stats.insert_errors++;
+        stats.errors.push({ type: 'insert', message: error.message || String(error), link });
       } else {
         inserted++;
         if (inserted % 10 === 0) phase(`UPSERT progress inserted=${inserted} conflicts=${conflicts}`);
       }
     }
     phase(`UPSERT complete inserted=${inserted} conflicts=${conflicts}`);
+    if (!inserted && !stats.zero_reason) {
+      stats.zero_reason = stats.insert_errors ? 'all_inserts_failed' : (conflicts ? 'all_duplicates' : 'unknown');
+    }
     phase('DONE');
     stats.inserted = inserted;
     stats.conflicts = conflicts;
