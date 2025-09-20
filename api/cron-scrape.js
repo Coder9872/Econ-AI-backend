@@ -1,5 +1,5 @@
-// Scheduled cron endpoint for Vercel; offloads heavy work to Supabase Edge Function
-const { triggerEdgeNewsScrape } = require('../services/edgeOffloader');
+// Scheduled cron endpoint for Vercel; enqueues a daily scrape job via Upstash QStash.
+const { Client: QStashClient } = require('@upstash/qstash');
 
 // Helper to compute default date range (yesterday -> today) in YYYY-MM-DD
 function defaultRange() {
@@ -34,16 +34,26 @@ module.exports = async (req, res) => {
   const limit = limitNum ? parseInt(limitNum, 10) : undefined;
   const candidateLimit = candNum ? parseInt(candNum, 10) : undefined;
   const started = Date.now();
-  console.log(`[cron-scrape] START from=${from} to=${to} limit=${limit||'default'} candidateLimit=${candidateLimit||'default'} isCron=${isCronRewrite}`);
+  console.log(`[cron-scrape] START (queue) from=${from} to=${to} limit=${limit||'default'} candidateLimit=${candidateLimit||'default'} isCron=${isCronRewrite}`);
 
+  if (!process.env.QSTASH_TOKEN) {
+    return res.status(500).json({ error: 'Missing QSTASH_TOKEN' });
+  }
+  const base = process.env.VERCEL_URL || process.env.VERCEL_API_BASE;
+  if (!base) return res.status(500).json({ error: 'Missing VERCEL_URL (or VERCEL_API_BASE)' });
+  const client = new QStashClient({ token: process.env.QSTASH_TOKEN });
   try {
-    const result = await triggerEdgeNewsScrape({ from, to, limit, candidateLimit });
+    const publishRes = await client.publishJSON({
+      url: `${base}/api/articles/manual-scrape`,
+      body: { from, to, limit: limit || null, candidateLimit: candidateLimit || null },
+      retries: 3
+    });
     const dur = Date.now() - started;
-    console.log(`[cron-scrape] COMPLETE status=${result.ok?'ok':'fail'} duration_ms=${dur}`);
-    return res.status(result.ok ? 200 : (result.status || 500)).json({ ...result, from, to, limit: limit||null, candidateLimit: candidateLimit||null, duration_ms: dur });
+    console.log(`[cron-scrape] QUEUED duration_ms=${dur}`);
+    return res.status(202).json({ message: 'scheduled_daily_scrape', from, to, limit: limit||null, candidateLimit: candidateLimit||null, publish: publishRes, duration_ms: dur });
   } catch (e) {
     const dur = Date.now() - started;
-    console.error('[cron-scrape] ERROR', e?.message || e);
-    return res.status(500).json({ error: e.message || 'cron_error', from, to, duration_ms: dur });
+    console.error('[cron-scrape] ERROR queue', e?.message || e);
+    return res.status(500).json({ error: e.message || 'queue_failed', from, to, duration_ms: dur });
   }
 };

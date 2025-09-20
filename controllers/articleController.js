@@ -1,7 +1,9 @@
 const { supabase } = require('../models/supabaseClient');
 const express = require('express');
 const { fetchAndStoreNews } = require('../services/news-scrape');
-const { triggerEdgeNewsScrape } = require('../services/edgeOffloader');
+// Upstash QStash client for scheduling per-day jobs
+const { Client: QStashClient } = require('@upstash/qstash');
+const qstash = process.env.QSTASH_TOKEN ? new QStashClient({ token: process.env.QSTASH_TOKEN }) : null;
 /** @typedef {import('../models/types').Article} Article */
 /** @typedef {import('../models/types').ArticleInsert} ArticleInsert */
 /** @typedef {import('../models/types').ArticleUpdate} ArticleUpdate */
@@ -31,12 +33,13 @@ const getAllArticles = async (req, res) => {
             .from('Articles')
             .select('*');
             // Support sorting by article_date via query param ?sort=asc or ?sort=desc (default: desc)
+            //default sort by relevance
             const sortParam = (req.query.sort || 'desc').toString().toLowerCase();
             if (data && Array.isArray(data)) {
                 data.sort((a, b) => {
-                    const aTime = a && a.article_date ? new Date(a.article_date).getTime() : -Infinity;
-                    const bTime = b && b.article_date ? new Date(b.article_date).getTime() : -Infinity;
-                    return sortParam === 'asc' ? aTime - bTime : bTime - aTime;
+                    const aRel = a && a.relevance ? a.relevance : -Infinity;
+                    const bRel = b && b.relevance ? b.relevance : -Infinity;
+                    return sortParam === 'asc' ? aRel - bRel : bRel - aRel;
                 });
             }
         if (error) throw error;
@@ -168,84 +171,83 @@ const deleteArticleById = async (req, res) => {
     }
 }
 
+const { verifyQStash } = require('../services/qstashReceiver');
 // POST /api/articles/manual-scrape
-// Body: { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD', limit?: number }
-// Query: ?async=1 to run old fire-and-forget behavior (not reliable on serverless)
-// Default now waits for completion so inserts succeed before response ends.
+// Body: { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD', limit?: number, candidateLimit?: number, split?: boolean }
+// If the range spans multiple days OR split flag present, enqueue one job per day via QStash.
+// Otherwise execute synchronously (single-day) to return results immediately.
 const manualScrape = async (req, res) => {
-    const { from, to, limit, candidateLimit, offload } = req.body || {};
+    const { from, to, limit, candidateLimit, split } = req.body || {};
     if (!from || !to) {
         return res.status(400).json({ error: 'Both "from" and "to" dates are required' });
     }
-
-    // Modes:
-    //   sync  (default) : wait for completion & return stats (best for small ranges)
-    //   async (?async=1) : fire & forget (NOT reliable on serverless – discouraged)
-    //   offload (?offload=1 or body.offload=1) : trigger Supabase Edge Function to do the heavy work
-    const asyncMode = req.query.async === '1' || req.query.async === 'true';
-    const offloadMode = offload === 1 || offload === true || req.query.offload === '1' || req.query.offload === 'true';
-
     const start = Date.now();
     const limitNum = typeof limit === 'number' ? limit : parseInt(limit, 10);
     const validLimit = Number.isFinite(limitNum) && limitNum > 0 && limitNum <= 500 ? limitNum : undefined;
     const candNum = typeof candidateLimit === 'number' ? candidateLimit : parseInt(candidateLimit, 10);
     const validCandidateLimit = Number.isFinite(candNum) && candNum > 0 ? candNum : undefined;
-    console.log(`[manualScrape] START range=${from}->${to} limit=${validLimit || 'default'} candidateLimit=${validCandidateLimit || 'default'} async=${asyncMode} offload=${offloadMode} at=${new Date(start).toISOString()}`);
+    const needsSplit = split === true || split === 1 || from !== to;
 
-    // Offload path (recommended for long / large ranges)
-    if (offloadMode) {
+    if (needsSplit) {
+        if (!qstash) {
+            return res.status(500).json({ error: 'QStash not configured (missing QSTASH_TOKEN)' });
+        }
         try {
-            const trigger = await triggerEdgeNewsScrape({ from, to, limit: validLimit, candidateLimit: validCandidateLimit });
+            const days = [];
+            const startDate = new Date(from);
+            const endDate = new Date(to);
+            if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+                return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+            }
+            for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+                days.push(d.toISOString().slice(0,10));
+            }
+            const base = process.env.VERCEL_URL || process.env.VERCEL_API_BASE;
+            if (!base) {
+                return res.status(500).json({ error: 'Missing VERCEL_URL (or VERCEL_API_BASE) env for callback URL' });
+            }
+            const url = `${base}/api/articles/manual-scrape`;
+            for (const day of days) {
+                // eslint-disable-next-line no-await-in-loop
+                await qstash.publishJSON({
+                    url,
+                        body: { from: day, to: day, limit: validLimit, candidateLimit: validCandidateLimit },
+                    retries: 3
+                });
+            }
             const dur = Date.now() - start;
-            return res.status(trigger.ok ? 202 : (trigger.status || 500)).json({
-                message: trigger.ok ? 'Offloaded scrape to edge function' : 'Edge offload failed',
-                mode: 'offload',
-                from,
-                to,
+            return res.status(202).json({
+                message: 'Scheduled per-day scrape jobs',
+                days: days.length,
+                range: { from, to },
                 limit: validLimit || null,
                 candidateLimit: validCandidateLimit || null,
-                duration_ms: dur,
-                edge: trigger
+                duration_ms: dur
             });
         } catch (e) {
             const dur = Date.now() - start;
-            console.error('[manualScrape] offload error', e);
-            return res.status(500).json({ error: e.message || 'offload_failed', duration_ms: dur });
+            console.error('[manualScrape][queue] error', e);
+            return res.status(500).json({ error: e.message || 'queue_failed', duration_ms: dur });
         }
     }
 
-    if (asyncMode) {
-        res.status(202).json({ message: `Scrape (async) started for ${from} -> ${to}`, from, to, limit: validLimit || null, candidateLimit: validCandidateLimit || null });
-        fetchAndStoreNews(from, to, { mode: 'manual', manualLimit: validLimit, candidateLimit: validCandidateLimit })
-            .then(stats => {
-                const dur = Date.now() - start;
-                console.log(`[manualScrape] COMPLETE async range=${from}->${to} limit=${validLimit || 'default'} candidateLimit=${validCandidateLimit || 'default'} duration_ms=${dur} inserted=${stats?.inserted ?? 'n/a'}`);
-            })
-            .catch(err => {
-                const dur = Date.now() - start;
-                console.error(`[manualScrape] ERROR async range=${from}->${to} limit=${validLimit || 'default'} candidateLimit=${validCandidateLimit || 'default'} duration_ms=${dur} msg=${err?.message || err}`);
-            });
-        return;
+    // Single day synchronous execution (may be invoked by QStash queued job)
+    const sigHeader = req.headers['upstash-signature'];
+    if (sigHeader) {
+        // Validate signature if signing keys configured
+        const verification = await verifyQStash(req.rawBody || JSON.stringify(req.body || {}), String(sigHeader));
+        if (!verification.valid) {
+            return res.status(401).json({ error: 'invalid_qstash_signature', detail: verification.error });
+        }
     }
-
-    // Sync (wait) path
+    // Execute local scrape
     try {
         const stats = await fetchAndStoreNews(from, to, { mode: 'manual', manualLimit: validLimit, candidateLimit: validCandidateLimit });
         const dur = Date.now() - start;
-        console.log(`[manualScrape] COMPLETE sync range=${from}->${to} limit=${validLimit || 'default'} candidateLimit=${validCandidateLimit || 'default'} duration_ms=${dur} inserted=${stats?.inserted} zero_reason=${stats?.zero_reason || 'none'}`);
-        const statusCode = stats && stats.inserted > 0 ? 200 : 200; // still 200 but client can inspect zero_reason
-        return res.status(statusCode).json({
-            message: stats.inserted ? 'Scrape completed' : 'Scrape completed with zero inserts',
-            from,
-            to,
-            limit: validLimit || null,
-            candidateLimit: validCandidateLimit || null,
-            duration_ms: dur,
-            stats: stats || null
-        });
+        return res.status(200).json({ message: 'scrape_complete', from, to, stats, duration_ms: dur });
     } catch (err) {
         const dur = Date.now() - start;
-        console.error(`[manualScrape] ERROR sync range=${from}->${to} limit=${validLimit || 'default'} candidateLimit=${validCandidateLimit || 'default'} duration_ms=${dur} msg=${err?.message || err}`);
+        console.error('[manualScrape] error', err);
         return res.status(500).json({ error: err?.message || 'scrape_failed', duration_ms: dur });
     }
 };

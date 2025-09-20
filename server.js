@@ -7,20 +7,20 @@
 //   TOP_ARTICLE_LIMIT_MANUAL, TOP_ARTICLE_LIMIT_CRON
 //   CRON_SUMMARY_CONCURRENCY
 //   GEMINI_MAX_REQUESTS_PER_MIN, GEMINI_ADAPTIVE_LIMIT
-//   SUPABASE_EDGE_SCRAPE_URL, SUPABASE_EDGE_FUNCTION_KEY (for offloading cron)
+//   QSTASH_TOKEN (for Upstash QStash scheduling)
+//   VERCEL_URL (auto in prod) or VERCEL_API_BASE (fallback for local callback construction)
 //   CRON_SECRET (optional header x-cron-secret)
 const express = require("express");
 const app = express();
 const articleRoutes = require("./routes/articles");
-const offloadRoutes = require("./routes/offload");
 const healthRoutes = require("./routes/health");
 require("dotenv").config();
 const PORT = process.env.PORT || 4000;
 
-app.use(express.json());
+// Capture raw body for QStash signature verification while still parsing JSON
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf.toString(); } }));
 app.use("/api/articles", articleRoutes);
-app.use('/api/offload', offloadRoutes); // proxy that hides Supabase project ref
-app.use('/api', healthRoutes); // /api/offload/health presence check
+app.use('/api', healthRoutes); // /api/offload/health presence check (renamed semantics now includes QStash)
 
 // Only start listening when executed directly (local dev).
 if (require.main === module) {
