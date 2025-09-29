@@ -11,6 +11,8 @@
 //   VERCEL_URL (auto in prod) or VERCEL_API_BASE (fallback for local callback construction)
 //   CRON_SECRET (optional header x-cron-secret)
 const express = require("express");
+const cors = require('cors');
+const helmet = require('helmet');
 const app = express();
 const articleRoutes = require("./routes/articles");
 const healthRoutes = require("./routes/health");
@@ -21,23 +23,38 @@ const PORT = process.env.PORT || 4000;
 // Capture raw body for QStash signature verification while still parsing JSON
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf.toString(); } }));
 
-// Basic Content Security Policy middleware (adds permissive connect-src so browser devtools & fetches work)
-app.use((req, res, next) => {
-  // Force-set CSP (overwrites any prior) with explicit default-src (not 'none').
-  const policy = [
-    "default-src 'self'",
-    "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data:",
-    "font-src 'self' data:",
-    "connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:*",
-    "object-src 'none'",
-    "base-uri 'self'",
-    "frame-ancestors 'self'"
-  ].join('; ');
-  res.setHeader('Content-Security-Policy', policy);
-  next();
-});
+// Helmet security headers (production ready defaults)
+app.use(helmet({
+  // Keep frameguard, hsts, etc. Defaults are fine; CSP added separately below
+}));
+app.use(helmet.contentSecurityPolicy({
+  useDefaults: false,
+  directives: {
+    defaultSrc: ["'self'"],
+    scriptSrc: ["'self'"],
+    styleSrc: ["'self'", "'unsafe-inline'"],
+    imgSrc: ["'self'", 'data:'],
+    fontSrc: ["'self'", 'data:'],
+    connectSrc: ["'self'", 'https:', 'wss:', 'http://localhost:*', 'http://127.0.0.1:*'],
+    objectSrc: ["'none'"],
+    baseUri: ["'self'"],
+    frameAncestors: ["'self'"],
+  },
+}));
+
+// CORS allowlist (env CORS_ALLOW_ORIGINS comma-separated)
+const ALLOWED_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || 'http://localhost:3000,https://econ-ai.vercel.app').split(',').map(o => o.trim());
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // Non-browser or same-origin
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS not allowed for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With']
+}));
+// Preflight handling is covered by the global CORS middleware above.
 app.use("/api/articles", articleRoutes);
 app.use('/api', healthRoutes); // /api/offload/health presence check (renamed semantics now includes QStash)
 app.use('/api/daily-summary', dailySummaryRoutes);

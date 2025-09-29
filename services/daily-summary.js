@@ -48,20 +48,20 @@ function buildPrompt(articles) {
 
 OUTPUT STRICTLY AS A SINGLE VALID JSON OBJECT with these keys ONLY:
 {
-  "overview": string (2-4 concise paragraphs giving holistic narrative),
-  "what_happened": string (bullet style: major events & catalysts),
-  "what_to_expect": string (forward-looking catalysts, risks, scheduled data),
-  "key_winners_losers": string (notable outperformers/underperformers + reasons; tickers if present),
-  "policy_developments": string (central bank, fiscal, regulatory, geopolitical),
-  "market_sentiment": string (tone, flows, risk appetite),
-  "economic_releases": string (macro data prints with figures vs expectations),
-  "sector_performance": string (leaders/laggards and drivers)
+  "overview": string,
+  "what_happened": string,
+  "what_to_expect": string,
+  "key_winners_losers": string,
+  "policy_developments": string,
+  "market_sentiment": string,
+  "economic_releases": string,
+  "sector_performance": string
 }
 
-STYLE:
-- Objective, data-driven, neutral tone.
-- Include key numbers when inferable. Do NOT hallucinate unavailable figures.
-- Omit a section only if no meaningful info; otherwise fill it.
+STYLE (markdown-ready within each string):
+- Start each section value with a bolded header like "**Overview:**" then provide content.
+- Use "- " bullets for lists; use "**" for emphasis of labels and key numbers.
+- Objective, data-driven, neutral tone. Include key numbers when inferable. Do NOT hallucinate.
 
 RULES (CRITICAL):
 - Output MUST be a single valid JSON object. No surrounding markdown fences (no backticks).
@@ -72,13 +72,22 @@ ARTICLES_JSON = ${articlesJson}
 Return ONLY the JSON object.`;
 }
 
-async function fetchTopArticles() {
-  // Globally fetch top articles by relevance (no date filter)
-  const { data, error } = await supabase
+async function fetchTopArticles(targetDate) {
+  // Fetch top articles by relevance, optionally filtered to a specific date (UTC window)
+  const q = supabase
     .from('Articles')
     .select('id,title,summary,relevance')
     .order('relevance', { ascending: false })
     .limit(MAX_ARTICLES);
+  if (targetDate) {
+    // Constrain to [dateT00:00Z, nextDateT00:00Z)
+    const start = new Date(targetDate + 'T00:00:00.000Z');
+    if (!Number.isNaN(start.getTime())) {
+      const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+      q.gte('article_date', start.toISOString()).lt('article_date', end.toISOString());
+    }
+  }
+  const { data, error } = await q;
   if (error) throw error;
   return data || [];
 }
@@ -99,15 +108,25 @@ function extractJson(text) {
   }
 }
 
-async function generateDailySummary() {
+function normalizeDate(input) {
+  const raw = String(input || '').trim();
+  const m = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!m) return null;
+  const [_, y, mo, d] = m; // eslint-disable-line @typescript-eslint/no-unused-vars
+  const mm = String(Math.max(1, Math.min(12, parseInt(mo, 10)))).padStart(2, '0');
+  const dd = String(Math.max(1, Math.min(31, parseInt(d, 10)))).padStart(2, '0');
+  return `${m[1]}-${mm}-${dd}`;
+}
+
+async function generateDailySummary(dateArg) {
   await ensureTable();
-  const today = new Date().toISOString().slice(0,10);
-  const existing = await supabase.from('DailySummaries').select('id').eq('summary_date', today).maybeSingle?.();
+  const normalized = normalizeDate(dateArg) || new Date().toISOString().slice(0,10);
+  const existing = await supabase.from('DailySummaries').select('id').eq('summary_date', normalized).maybeSingle?.();
   if (existing && existing.data && existing.data.id) {
-    return { skipped: true, reason: 'already_exists', date: today };
+    return { skipped: true, reason: 'already_exists', date: normalized };
   }
-  const articles = await fetchTopArticles();
-  if (!articles.length) return { skipped: true, reason: 'no_articles', date: today };
+  const articles = await fetchTopArticles(normalized);
+  if (!articles.length) return { skipped: true, reason: 'no_articles', date: normalized };
   const prompt = buildPrompt(articles);
   let rawText = '';
   try {
@@ -121,7 +140,7 @@ async function generateDailySummary() {
     return { error: 'parse_failed', note: 'Model output not valid JSON per spec', raw: rawText.slice(0, 700) };
   }
   const insertPayload = {
-    summary_date: today,
+    summary_date: normalized,
     model: DAILY_MODEL,
     overview: parsed.overview || null,
     what_happened: parsed.what_happened || null,
@@ -135,7 +154,7 @@ async function generateDailySummary() {
   };
   const { error: insErr } = await supabase.from('DailySummaries').insert([insertPayload]);
   if (insErr) return { error: 'insert_failed', message: insErr.message };
-  return { date: today, inserted: true };
+  return { date: normalized, inserted: true };
 }
 
 module.exports = { generateDailySummary };

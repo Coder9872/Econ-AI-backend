@@ -34,7 +34,8 @@ module.exports = async (req, res) => {
     }
   }
   try {
-    const result = await generateDailySummary();
+    const targetDate = body && typeof body.date === 'string' ? body.date : undefined;
+    const result = await generateDailySummary(targetDate);
     return res.status(200).json(result);
   } catch (e) {
     return res.status(500).json({ error: e.message || 'summary_failed' });

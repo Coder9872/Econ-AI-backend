@@ -10,10 +10,10 @@ const NEWS_API_URL = process.env.NEWS_API_URL;
 const genAI = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
-// Allow model override via env GEMINI_MODEL, fallback to prior default
-const GEMINI_MODEL = 'gemini-2.5-flash-lite';
+// Allow model override via env GEMINI_MODEL, default to gemini-2.5-pro for grouped analysis
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-pro';
 // Separate model for title-only ranking (defaults to full analysis model)
-const GEMINI_TITLE_MODEL = 'gemini-2.5-flash'
+const GEMINI_TITLE_MODEL = process.env.GEMINI_TITLE_MODEL || 'gemini-2.5-flash';
 // Title ranking batch size and keep ratio (fraction of each batch to keep)
 const TITLE_RANK_BATCH_SIZE = 100; //change to 100
 const TITLE_RANK_KEEP_RATIO = 0.10; // keep top 10% of each batch (adapts to smaller batches)
@@ -94,7 +94,7 @@ function parseRetryDelaySeconds(err) {
 // Prompt builder for relevance/category/summary scoring
 const genRelPrompt = (title = "", content = "") => {
   const clippedContent = String(content).slice(0, 1500); // configurable prompt size
-    return `You are an expert financial analyst and AI editor for a platform called "econ AI". Your audience consists of investors who need fast, accurate, and actionable information.
+  return `You are an expert financial analyst and AI editor for a platform called "econ AI". Your audience consists of investors who need fast, accurate, and actionable information.
 
 Your task is to analyze the provided news article and return a single, valid JSON object containing three keys: "relevance_score", "categories", and "summary_points".
 
@@ -102,15 +102,13 @@ Your task is to analyze the provided news article and return a single, valid JSO
 Assign a relevance_score from 1 to 100 based on the article's importance and market-moving potential for a general stock market investor.
 
 90-100 (Must Read): Direct, high-impact news. (e.g., Fed rate decisions, major inflation reports, mega-cap earnings, significant M&A).
-70-89 (Highly Relevant): Significant news impacting a sector or large company. (e.g., FDA approvals, production warnings, major product launches).
-40-69 (Relevant Context): Important for broader understanding, but not an immediate trade catalyst. (e.g., analyst ratings, general market analysis, geopolitical shifts).
-10-39 (General Interest): Loosely related to business, not directly actionable. (e.g., executive profiles, long-term trend pieces).
+70-89 (Highly Relevant): Significant sector/company impact (approvals, warnings, major launches, guidance changes).
+40-69 (Relevant Context): Useful context; not immediate catalysts (ratings, macro analysis).
+10-39 (General Interest): Loosely related to business.
 1-9 (Irrelevant): Not financial news.
 
 ### 2. Categories
 Assign one or more categories from the predefined list below. The output must be a JSON array of strings.
-
-Categories List:
 - Macroeconomics & Policy
 - Market Analysis & Sentiment
 - Geopolitics & Regulation
@@ -122,20 +120,19 @@ Categories List:
 - Consumer & Retail
 - Digital Assets & Crypto
 
-### 3. Summary Points
-Create a concise, insightful summary as a JSON array of strings, with each string being a single bullet point. The summary MUST:
-- Summarize the following text in a concise manner providing a comprehensive overview
-      and a list of key things to look out for, 5-6 bullet points long
-- Include the most important numbers or metrics mentioned.
-- Explain the "so what?" – the implication or impact for the market or company. 3-4 bullet points long
+### 3. Summary Points (markdown-ready)
+Return an array of 5-10 concise bullet items. EACH item must start with a bolded label and a colon using markdown, for example:
+**What happened:** ...; **Key numbers:** ...; **Why it matters:** ...; **Context:** ...
+Do NOT wrap in markdown code fences. The array items are plain strings containing markdown emphasis.
 
 ### Required Output Format
-You MUST respond with a single, valid JSON object and nothing else. Do not include introductory text, explanations, or markdown. The JSON object must contain:
+MUST be a single valid JSON object, no markdown fences, no extra text:
 {
-    "relevance_score": <integer 1-100>,
-    "categories": [<string>, ...],
-    "summary_points": [<string>, ...]  // 3-4 items
+  "relevance_score": <integer 1-100>,
+  "categories": [<string>, ...],
+  "summary_points": [<string>, ...]  // 3-5 items, each begins with a bolded label (e.g., **What happened:** ...)
 }
+  Responses should be aorund 150-300 words long
 
 Article to Analyze:
 Title:
@@ -197,6 +194,104 @@ async function summarizeWithGemini(title, content) {
     console.error("Error summarizing text (final):", lastErr);
   }
   return "";
+}
+
+// Grouped analysis: send ~20 articles per request to Gemini 2.5 Pro, parse per-article JSON, and optionally a group-level combined summary.
+const GROUP_SIZE = 20;
+
+function buildGroupedAnalysisPrompt(group) {
+  // Each group item: { idx: number, title: string, content: string }
+  const items = group.map((g, i) => ({
+    idx: g.idx,
+    title: String(g.title || '').slice(0, 260),
+    content: String(g.content || '').replace(/\s+/g, ' ').slice(0, 1800)
+  }));
+  const itemsJson = JSON.stringify(items);
+  return `You are an expert financial analyst. Analyze the following news items and return JSON ONLY.
+
+For EACH item, output an object with keys:
+- idx: number (echo from input)
+- relevance_score: integer 0-100
+- categories: array of strings (from this list only: "Macroeconomics & Policy", "Market Analysis & Sentiment", "Geopolitics & Regulation", "Corporate Earnings & Guidance", "Mergers & Acquisitions (M&A)", "Technology Sector", "Energy & Commodities", "Healthcare & Pharma", "Consumer & Retail", "Digital Assets & Crypto")
+- summary_points: array of 3-5 markdown-ready strings, each beginning with a bolded label, e.g., "**What happened:** ..."
+
+Also provide a short combined summary for the whole group.
+
+STRICT OUTPUT FORMAT (no commentary, no markdown fences):
+{
+  "articles": [
+    { "idx": number, "relevance_score": number, "categories": [string,...], "summary_points": [string,...] },
+    ... one per input item in the SAME ORDER ...
+  ],
+  "combined": { "summary_points": [string,...] }
+}
+
+INPUT_ITEMS = ${itemsJson}
+Return ONLY the JSON object.`;
+}
+
+function parseGroupedAnalysis(rawText, expectedCount) {
+  if (!rawText) return { perItem: [], combined: null };
+  const stripped = rawText.replace(/^```(json)?/i, '').replace(/```\s*$/,'').trim();
+  const first = stripped.indexOf('{');
+  const last = stripped.lastIndexOf('}');
+  if (first === -1 || last === -1 || last <= first) return { perItem: [], combined: null };
+  let obj;
+  try { obj = JSON.parse(stripped.slice(first, last + 1)); } catch { return { perItem: [], combined: null }; }
+  const per = Array.isArray(obj?.articles) ? obj.articles : [];
+  const trimmed = per.slice(0, expectedCount).map(x => ({
+    idx: Number.isInteger(x?.idx) ? x.idx : null,
+    relevance_score: Number.isFinite(Number(x?.relevance_score)) ? parseInt(x.relevance_score, 10) : 0,
+    categories: Array.isArray(x?.categories) ? x.categories : [],
+    summary_points: Array.isArray(x?.summary_points) ? x.summary_points : []
+  }));
+  return { perItem: trimmed, combined: obj?.combined || null };
+}
+
+// Non-batch flow: per-group single request with limited concurrency
+const ANALYSIS_BATCH_SIZE = 100; // number of original articles per window; inside each window, we create groups of 20
+async function analyzeArticlesInBatches(articles, phase) {
+  const results = [];
+  const windows = chunkArray(articles, ANALYSIS_BATCH_SIZE);
+  for (let w = 0; w < windows.length; w++) {
+    const windowArts = windows[w];
+    const groups = chunkArray(windowArts.map((art, i) => ({
+      art,
+      idx: i,
+      title: art.title ?? art.headline ?? '',
+      content: art.content ?? art.summary ?? ''
+    })), GROUP_SIZE);
+    phase?.(`ANALYSIS window ${w + 1}/${windows.length} groups=${groups.length} method=single`);
+    const concurrency = Math.min(5, groups.length);
+    let gIndex = 0;
+    const out = [];
+    await Promise.all(Array.from({ length: concurrency }, () => (async function worker() {
+      while (gIndex < groups.length) {
+        const curr = gIndex++;
+        const group = groups[curr];
+        try {
+          await limiterSummary.acquire();
+          const resp = await genAI.models.generateContent({ model: GEMINI_MODEL, contents: buildGroupedAnalysisPrompt(group) });
+          const rawText = resp?.text ?? '';
+          const parsed = parseGroupedAnalysis(rawText, group.length);
+          for (let m = 0; m < group.length; m++) {
+            const per = parsed.perItem[m] || {};
+            const gItem = group[m];
+            out.push({ art: gItem.art, analysis: {
+              relevance_score: per.relevance_score ?? 0,
+              categories: per.categories || [],
+              summary_points: per.summary_points || []
+            }});
+          }
+        } catch (err) {
+          console.error('[groupedAnalyze] error:', err?.message || err);
+          for (const gItem of group) out.push({ art: gItem.art, analysis: { relevance_score: 0, categories: [], summary_points: [] } });
+        }
+      }
+    })()));
+    results.push(...out);
+  }
+  return results;
 }
 
 // ---------------- Title-only pre-ranking to reduce detailed requests ----------------
@@ -430,7 +525,7 @@ async function fetchAndStoreNews(from, to, opts = {}) {
     }
 
     // First pass: run unified Gemini prompt for each article (title+content) to get relevance, categories, summary points
-    const enriched = [];
+  const enriched = [];
     let analyzedCount = 0;
     let skippedNoTitle = 0;
     async function processOne(art){
@@ -457,25 +552,20 @@ async function fetchAndStoreNews(from, to, opts = {}) {
         enriched.push({ ...art, _error: 'exception' });
       }
     }
-    if (mode === 'manual') {
-      phase('ANALYSIS start (sequential)');
-      for (const art of articles) {
-        // sequential to keep latency predictable
-        // eslint-disable-next-line no-await-in-loop
-        await processOne(art);
-      }
-    } else {
-      // simple pool concurrency for cron mode
-      phase('ANALYSIS start (concurrent)');
-      let index = 0;
-      const pool = Array.from({length: Math.min(concurrency, articles.length)}, () => (async function worker(){
-        while(index < articles.length){
-          const current = articles[index++];
-          // eslint-disable-next-line no-await-in-loop
-          await processOne(current);
+    {
+  // Grouped single requests (no batch API), windows of ~100, groups of 20
+  phase(`ANALYSIS start (grouped single requests, mode=${mode})`);
+      const batched = await analyzeArticlesInBatches(articles, phase);
+      for (const item of batched) {
+        const art = item.art;
+        const analysis = item.analysis;
+        if (!analysis || typeof analysis !== 'object') {
+          enriched.push({ ...art, _error: 'analysis_failed' });
+        } else {
+          analyzedCount++;
+          enriched.push({ ...art, _analysis: analysis });
         }
-      })());
-      await Promise.all(pool);
+      }
     }
   phase(`ANALYSIS complete analyzed=${analyzedCount} enriched_total=${enriched.length}`);
   stats.analyzed = analyzedCount;
@@ -547,8 +637,8 @@ async function fetchAndStoreNews(from, to, opts = {}) {
       ? analysis.summary_points
       : [];
 
-  // Build the 'summary' text: bullet points only (no relevance/categories here)
-  const bulletLines = summaryPoints.length ? summaryPoints.map(p => `• ${p}`) : [];
+  // Build the 'summary' text: bullet points only (markdown-ready, '- ')
+  const bulletLines = summaryPoints.length ? summaryPoints.map(p => `- ${p}`) : [];
   const summaryText = bulletLines.length ? bulletLines.join('\n') : null;
 
     // Build the JSON payload for the `symbols` json/jsonb column (only tickers here)
