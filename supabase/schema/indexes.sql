@@ -20,3 +20,13 @@ create index if not exists articles_article_date_idx
 
 -- Optional: if categories JSONB filtering becomes common, add a GIN index.
 -- create index if not exists articles_categories_gin on public."Articles" using gin (categories jsonb_path_ops);
+
+-- Users & personalization tables -------------------------------------------
+create unique index if not exists users_email_unique_lower
+  on public."Users" (lower(email));
+
+create unique index if not exists users_favorite_articles_user_article_idx
+  on public."UsersFavoriteArticles" (user_id, article_id);
+
+create unique index if not exists users_read_articles_user_article_idx
+  on public."UsersReadArticles" (user_id, article_id);

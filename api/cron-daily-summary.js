@@ -19,13 +19,24 @@ module.exports = async (req, res) => {
   // Ensure protocol is included for QStash URL
   const base = rawBase.startsWith('http') ? rawBase : `https://${rawBase}`;
   const client = new QStashClient({ token: process.env.QSTASH_TOKEN, baseUrl: process.env.QSTASH_URL });
+  const bypassToken = process.env.VERCEL_PROTECTION_BYPASS_TOKEN || process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  const makeTargetUrl = () => new URL(`${base}/api/daily-summary/generate`).toString();
+  const buildHeaders = () => {
+    if (!bypassToken) return undefined;
+    return {
+      'x-vercel-protection-bypass': bypassToken,
+      'x-vercel-set-bypass-cookie': 'true',
+    };
+  };
   const now = new Date();
   const target = new Date(now.getTime() - 24*60*60*1000).toISOString().slice(0,10);
   try {
+    const targetUrl = makeTargetUrl();
     const publishRes = await client.publishJSON({
-      url: `${base}/api/daily-summary/generate`,
+      url: targetUrl,
       body: { date: target },
-      retries: 3
+      retries: 3,
+      headers: buildHeaders(),
     });
     const dur = Date.now() - started;
     return res.status(202).json({ message: 'scheduled_daily_summary', date: target, publish: publishRes, duration_ms: dur });

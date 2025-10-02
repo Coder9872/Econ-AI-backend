@@ -256,13 +256,23 @@ const manualScrape = async (req, res) => {
             }
             // Ensure protocol is included for QStash URL
             const base = rawBase.startsWith('http') ? rawBase : `https://${rawBase}`;
-            const url = `${base}/api/articles/manual-scrape`;
+            const bypassToken = process.env.VERCEL_PROTECTION_BYPASS_TOKEN || process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+            const buildTargetUrl = () => new URL(`${base}/api/articles/manual-scrape`).toString();
+            const buildHeaders = () => {
+                if (!bypassToken) return undefined;
+                return {
+                    'x-vercel-protection-bypass': bypassToken,
+                    'x-vercel-set-bypass-cookie': 'true',
+                };
+            };
+            const url = buildTargetUrl();
             for (const day of days) {
                 // eslint-disable-next-line no-await-in-loop
                 await qstash.publishJSON({
                     url,
                         body: { from: day, to: day, limit: validLimit, candidateLimit: validCandidateLimit },
-                    retries: 3
+                    retries: 3,
+                    headers: buildHeaders(),
                 });
             }
             const dur = Date.now() - start;

@@ -51,12 +51,24 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'qstash_init_failed', message: initError.message });
   }
   
+  const bypassToken = process.env.VERCEL_PROTECTION_BYPASS_TOKEN || process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  const makeTargetUrl = () => new URL(`${base}/api/articles/manual-scrape`).toString();
+  const buildHeaders = () => {
+    if (!bypassToken) return undefined;
+    return {
+      'x-vercel-protection-bypass': bypassToken,
+      'x-vercel-set-bypass-cookie': 'true',
+    };
+  };
+
+  const targetUrl = makeTargetUrl();
   try {
-    console.log(`[cron-scrape] Publishing to QStash: ${base}/api/articles/manual-scrape`);
+    console.log(`[cron-scrape] Publishing to QStash: ${targetUrl}`);
     const publishRes = await client.publishJSON({
-      url: `${base}/api/articles/manual-scrape`,
+      url: targetUrl,
       body: { from, to, limit: limit || null, candidateLimit: candidateLimit || null },
-      retries: 3
+      retries: 3,
+      headers: buildHeaders(),
     });
     const dur = Date.now() - started;
     console.log(`[cron-scrape] QUEUED duration_ms=${dur}`);
@@ -79,7 +91,7 @@ module.exports = async (req, res) => {
       debug: {
         hasQstashToken: !!process.env.QSTASH_TOKEN,
         hasVercelUrl: !!process.env.VERCEL_URL,
-        targetUrl: `${base}/api/articles/manual-scrape`
+        targetUrl
       }
     });
   }

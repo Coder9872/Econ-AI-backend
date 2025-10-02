@@ -11,6 +11,7 @@
     { "src": "/api/(.*)", "dest": "/api/index.js" }
   ],
   "crons": [
-    { "path": "/api/cron-scrape", "schedule": "0 1 * * *" }
+    { "path": "/api/cron-scrape", "schedule": "0 1 * * *" },
+    { "path": "/api/cron-daily-summary", "schedule": "0 3 * * *" }
   ]
 }

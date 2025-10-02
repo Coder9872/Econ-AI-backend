@@ -17,6 +17,8 @@ const app = express();
 const articleRoutes = require("./routes/articles");
 const healthRoutes = require("./routes/health");
 const dailySummaryRoutes = require('./routes/dailySummary');
+const authRoutes = require('./routes/auth');
+const meRoutes = require('./routes/me');
 require("dotenv").config();
 const PORT = process.env.PORT || 4000;
 
@@ -58,6 +60,8 @@ app.use(cors({
 app.use("/api/articles", articleRoutes);
 app.use('/api', healthRoutes); // /api/offload/health presence check (renamed semantics now includes QStash)
 app.use('/api/daily-summary', dailySummaryRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/me', meRoutes);
 
 // Only start listening when executed directly (local dev).
 if (require.main === module) {

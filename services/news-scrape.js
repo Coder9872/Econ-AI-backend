@@ -6,6 +6,9 @@ const { performance } = require('node:perf_hooks');
 
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
 const NEWS_API_URL = process.env.NEWS_API_URL;
+const NEWS_API_PAGE_PARAM = process.env.NEWS_API_PAGE_PARAM || 'page';
+const NEWS_API_LIMIT_PARAM = process.env.NEWS_API_LIMIT_PARAM || 'limit';
+const NEWS_API_PAGE_SIZE = Math.max(1, parseInt(process.env.NEWS_API_PAGE_SIZE || '200', 10));
 
 const genAI = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -13,10 +16,10 @@ const genAI = new GoogleGenAI({
 // Allow model override via env GEMINI_MODEL, default to gemini-2.5-pro for grouped analysis
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-pro';
 // Separate model for title-only ranking (defaults to full analysis model)
-const GEMINI_TITLE_MODEL = process.env.GEMINI_TITLE_MODEL || 'gemini-2.5-flash';
+const GEMINI_TITLE_MODEL = process.env.GEMINI_TITLE_MODEL || 'gemini-2.5-pro';
 // Title ranking batch size and keep ratio (fraction of each batch to keep)
-const TITLE_RANK_BATCH_SIZE = 100; //change to 100
-const TITLE_RANK_KEEP_RATIO = 0.10; // keep top 10% of each batch (adapts to smaller batches)
+const TITLE_RANK_BATCH_SIZE = Math.max(1, parseInt(process.env.TITLE_RANK_BATCH_SIZE || '300', 10));
+const TITLE_RANK_KEEP_RATIO = Math.max(0.01, Math.min(1, parseFloat(process.env.TITLE_RANK_KEEP_RATIO || '0.04')));
 
 // ---------------- Gemini API Rate Limiting & Retry Helpers ----------------
 // Separate token buckets per model (title=2.5-pro, summary=2.5-flash-lite)
@@ -89,6 +92,22 @@ function parseRetryDelaySeconds(err) {
     }
   } catch (_) { /* ignore parse errors */ }
   return null;
+}
+
+function buildNewsApiUrl(extraParams = {}) {
+  if (!NEWS_API_URL) return '';
+  const entries = Object.entries(extraParams).filter(([, value]) => value !== undefined && value !== null);
+  try {
+    const url = new URL(NEWS_API_URL);
+    for (const [key, value] of entries) {
+      url.searchParams.set(key, String(value));
+    }
+    return url.toString();
+  } catch (_) {
+    const query = entries.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`).join('&');
+    const joiner = NEWS_API_URL.includes('?') ? '&' : '?';
+    return `${NEWS_API_URL}${joiner}${query}`;
+  }
 }
 
 // Prompt builder for relevance/category/summary scoring
@@ -365,6 +384,50 @@ async function scoreTitleBatch(items) {
   return [];
 }
 
+async function fetchArticlesPaginated(from, to, totalLimit, phase) {
+  const collected = [];
+  let page = 1;
+  let batches = 0;
+  while (collected.length < totalLimit) {
+    const remaining = totalLimit - collected.length;
+    const requestSize = Math.min(NEWS_API_PAGE_SIZE, remaining);
+    const params = {
+      api_token: NEWS_API_KEY,
+      from,
+      to,
+      [NEWS_API_LIMIT_PARAM]: String(requestSize),
+    };
+    if (NEWS_API_PAGE_PARAM) {
+      params[NEWS_API_PAGE_PARAM] = String(page);
+    }
+    const url = buildNewsApiUrl(params);
+    phase?.(`FETCH page=${page} size=${requestSize} collected=${collected.length}/${totalLimit}`);
+    const response = await axios.get(url, { timeout: 30_000 });
+    const raw = response.data;
+    const batch = Array.isArray(raw) ? raw : raw?.data ? raw.data : [];
+    batches++;
+    if (!Array.isArray(batch) || !batch.length) {
+      phase?.(`FETCH page=${page} returned 0 results; stopping pagination`);
+      break;
+    }
+    collected.push(...batch);
+    if (batch.length < requestSize) {
+      phase?.(`FETCH page=${page} returned ${batch.length} < ${requestSize}; reached end of feed`);
+      break;
+    }
+    page += 1;
+  }
+  return { articles: collected.slice(0, totalLimit), batches };
+}
+
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 function chunkArray(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -477,7 +540,7 @@ async function fetchAndStoreNews(from, to, opts = {}) {
   const manualLimit = manualLimitOverride || manualLimitEnv;
   const cronLimit = parseInt(process.env.TOP_ARTICLE_LIMIT_CRON || '75', 10);
   // Candidate fetch limits (raw articles scanned before ranking). Higher = more coverage, more cost/time.
-  const defaultCandidateCron = parseInt(process.env.CANDIDATE_FETCH_LIMIT_CRON || '800', 10); // target scanning 800
+  const defaultCandidateCron = parseInt(process.env.CANDIDATE_FETCH_LIMIT_CRON || '3000', 10); // target scanning 3000
   const defaultCandidateManual = parseInt(process.env.CANDIDATE_FETCH_LIMIT_MANUAL || '50', 10);
   const candidateLimitOverride = typeof opts.candidateLimit === 'number' && opts.candidateLimit > 0 ? opts.candidateLimit : null;
   const candidateLimit = candidateLimitOverride || (mode === 'cron' ? defaultCandidateCron : defaultCandidateManual);
@@ -485,9 +548,8 @@ async function fetchAndStoreNews(from, to, opts = {}) {
   // Override via env CRON_SUMMARY_CONCURRENCY if you have higher quota.
   const concurrency = parseInt(process.env.CRON_SUMMARY_CONCURRENCY || '3', 10);
   phase(`INIT mode=${mode} range=${from}->${to} limits(manual=${manualLimit},cron=${cronLimit}) candidateLimit=${candidateLimit} concurrency=${concurrency} models(summary=${GEMINI_MODEL}, title=${GEMINI_TITLE_MODEL}) rpms(summary=${limiterSummary.getBase()}, title=${limiterTitle.getBase()})`);
-  const url = `${NEWS_API_URL}?api_token=${NEWS_API_KEY}&from=${from}&to=${to}&limit=${candidateLimit}`;
   phase('FETCH start');
-  const stats = { mode, from, to, candidateLimit, manualLimit, cronLimit, started_at: new Date().toISOString(), fetched_total: 0, analyzed: 0, kept_ranked: 0, final_after_dedupe: 0, inserted: 0, conflicts: 0, insert_errors: 0, errors: [], zero_reason: null, duration_ms: 0 };
+  const stats = { mode, from, to, candidateLimit, manualLimit, cronLimit, started_at: new Date().toISOString(), fetched_total: 0, fetch_batches: 0, analyzed: 0, kept_ranked: 0, final_after_dedupe: 0, inserted: 0, conflicts: 0, insert_errors: 0, errors: [], zero_reason: null, duration_ms: 0 };
   if (!NEWS_API_URL || !NEWS_API_KEY) {
     stats.zero_reason = 'missing_env';
     stats.errors.push({ type: 'config', message: 'Missing NEWS_API_URL or NEWS_API_KEY env var' });
@@ -496,18 +558,23 @@ async function fetchAndStoreNews(from, to, opts = {}) {
     return stats;
   }
   try {
-    const response = await axios.get(url, { timeout: 30000 });
-    phase('FETCH done');
-    const raw = response.data;
-    let articles = Array.isArray(raw) ? raw : raw.data ? raw.data : [];
+    const { articles: fetchedArticles, batches } = await fetchArticlesPaginated(from, to, candidateLimit, phase);
+    phase(`FETCH done batches=${batches}`);
+    let articles = Array.isArray(fetchedArticles) ? fetchedArticles : [];
     if (!articles.length) {
       phase("NO ARTICLES - EXIT");
       stats.zero_reason = 'no_articles_returned';
       stats.duration_ms = Math.round(performance.now() - t0);
       return stats;
     }
-    phase(`ARTICLES fetched_total=${articles.length}`);
+    if (articles.length > 1) {
+      shuffleInPlace(articles);
+      phase(`ARTICLES fetched_total=${articles.length} shuffled_to_reduce_bias`);
+    } else {
+      phase(`ARTICLES fetched_total=${articles.length}`);
+    }
     stats.fetched_total = articles.length;
+    stats.fetch_batches = batches;
 
     // Stage 1: Title-only preselection to reduce detailed model calls
     try {
@@ -580,10 +647,9 @@ async function fetchAndStoreNews(from, to, opts = {}) {
     }
 
     // Rank by relevance_score descending, keep top 75
-    analyzed.sort((a,b) => b._analysis.relevance_score - a._analysis.relevance_score);
-  const sliceLimit = mode === 'cron' ? cronLimit : manualLimit;
-    const topRanked = analyzed.slice(0, sliceLimit);
-  phase(`RANK complete kept=${topRanked.length} limit=${sliceLimit} dyn(summary=${limiterSummary.getDyn()}, title=${limiterTitle.getDyn()})`);
+    const ranked = [...analyzed].sort((a,b) => b._analysis.relevance_score - a._analysis.relevance_score);
+    const topRanked = ranked;
+  phase(`RANK complete kept=${topRanked.length} limit=all dyn(summary=${limiterSummary.getDyn()}, title=${limiterTitle.getDyn()})`);
     stats.kept_ranked = topRanked.length;
 
     // Dedupe by Jaccard title similarity AFTER ranking

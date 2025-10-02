@@ -42,6 +42,73 @@ router.get('/recent', async (req, res) => {
   }
 });
 
+router.get('/archive', async (req, res) => {
+  try {
+    const yearParam = parseInt(String(req.query.year ?? ''), 10);
+    const monthParam = parseInt(String(req.query.month ?? ''), 10);
+    const hasYear = Number.isFinite(yearParam);
+    const hasMonth = Number.isFinite(monthParam);
+
+    if (hasYear && hasMonth) {
+      const year = yearParam;
+      const month = Math.max(1, Math.min(12, monthParam));
+      const start = new Date(Date.UTC(year, month - 1, 1));
+      const end = new Date(Date.UTC(year, month, 0));
+      const startStr = start.toISOString().slice(0, 10);
+      const endStr = end.toISOString().slice(0, 10);
+      const { data, error } = await supabase
+        .from('DailySummaries')
+        .select('id,summary_date,generated_at,overview')
+        .gte('summary_date', startStr)
+        .lte('summary_date', endStr)
+        .order('summary_date', { ascending: false });
+      if (error) throw error;
+      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=600');
+      return res.status(200).json({ data, year, month });
+    }
+
+    const { data, error } = await supabase
+      .from('DailySummaries')
+      .select('summary_date')
+      .order('summary_date', { ascending: false });
+    if (error) throw error;
+
+    const yearMap = new Map();
+    const rows = Array.isArray(data) ? data : [];
+    for (const row of rows) {
+      const rawDate = row?.summary_date;
+      if (!rawDate) continue;
+      const date = new Date(`${rawDate}T00:00:00Z`);
+      if (!Number.isFinite(date.getTime())) continue;
+      const year = date.getUTCFullYear();
+      const month = date.getUTCMonth() + 1;
+      const yearEntry = yearMap.get(year) || { year, months: new Map() };
+      if (!yearMap.has(year)) yearMap.set(year, yearEntry);
+      const monthEntry = yearEntry.months.get(month) || { month, count: 0, latestDate: null };
+      monthEntry.count += 1;
+      if (!monthEntry.latestDate || rawDate > monthEntry.latestDate) {
+        monthEntry.latestDate = rawDate;
+      }
+      yearEntry.months.set(month, monthEntry);
+    }
+
+    const archive = Array.from(yearMap.entries())
+      .sort((a, b) => b[0] - a[0])
+      .map(([year, entry]) => ({
+        year,
+        months: Array.from(entry.months.entries())
+          .sort((a, b) => b[0] - a[0])
+          .map(([month, info]) => ({ month, count: info.count, latestDate: info.latestDate })),
+      }));
+
+    const latestDate = rows.length ? rows[0].summary_date : null;
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=600');
+    return res.status(200).json({ archive, latestDate });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || 'fetch_failed' });
+  }
+});
+
 // GET /api/daily-summary/latest -> newest summary by summary_date
 router.get('/latest', async (req, res) => {
   try {

@@ -13,6 +13,14 @@ const { Client: QStashClient } = require('@upstash/qstash');
   if (!rawBase) throw new Error('Missing VERCEL_API_BASE (or VERCEL_URL)');
   const base = rawBase.startsWith('http') ? rawBase : `https://${rawBase}`;
   const client = new QStashClient({ token: process.env.QSTASH_TOKEN });
+  const bypassToken = process.env.VERCEL_PROTECTION_BYPASS_TOKEN || process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  const buildHeaders = () => {
+    if (!bypassToken) return undefined;
+    return {
+      'x-vercel-protection-bypass': bypassToken,
+      'x-vercel-set-bypass-cookie': 'true',
+    };
+  };
 
   // Optionally attach Vercel protection bypass if provided
   const bypass = process.env.VERCEL_PROTECTION_BYPASS_TOKEN;
@@ -22,11 +30,11 @@ const { Client: QStashClient } = require('@upstash/qstash');
   const summaryUrl = `${base}/api/daily-summary/generate${qs}`;
 
   console.log('[run-cron-qstash] publish scrape:', scrapeUrl);
-  const s1 = await client.publishJSON({ url: scrapeUrl, body: { from: date, to: date, limit: 150, candidateLimit: 800 }, retries: 3 });
+  const s1 = await client.publishJSON({ url: scrapeUrl, body: { from: date, to: date, limit: 150, candidateLimit: 800 }, retries: 3, headers: buildHeaders() });
   console.log('[run-cron-qstash] queued scrape:', s1);
 
   console.log('[run-cron-qstash] publish summary:', summaryUrl);
-  const s2 = await client.publishJSON({ url: summaryUrl, body: {}, retries: 3 });
+  const s2 = await client.publishJSON({ url: summaryUrl, body: {}, retries: 3, headers: buildHeaders() });
   console.log('[run-cron-qstash] queued summary:', s2);
 })().catch(err => {
   console.error('[run-cron-qstash] FAILED:', err?.message || err);
